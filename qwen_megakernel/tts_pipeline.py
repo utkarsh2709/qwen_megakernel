@@ -162,11 +162,15 @@ class MegakernelTTSPipeline:
         # all_codes_table[tok] = [16] tensor of all codebook tokens for tok
         # Used to build summed embeddings for next chunk
         all_codes_table = {}  # token_id -> [16] LongTensor
+        injected_tokens = set()  # tokens already injected into embed_weight
 
         current_token = CODEC_BOS_ID
         done = False
         total_steps = 0
         MAX_STEPS = max_codec_tokens * 8  # safety limit
+        repeat_count = 0
+        last_token = -1
+        MAX_REPEAT = 8  # stop if same token repeats 8x in a row
 
         while not done and total_steps < MAX_STEPS:
             # --- Phase A: decode CHUNK_SIZE tokens with current embeddings ---
@@ -175,7 +179,7 @@ class MegakernelTTSPipeline:
 
             for _ in range(CHUNK_SIZE):
                 # Inject summed embedding if we have it (fused batch lookup)
-                if current_token in all_codes_table:
+                if current_token in all_codes_table and current_token not in injected_tokens:
                     codes = all_codes_table[current_token]  # [16] LongTensor
                     with torch.no_grad():
                         # Fast stacked lookup: one gather op for all 15 CP tables
@@ -183,6 +187,7 @@ class MegakernelTTSPipeline:
                         cp_vecs = stacked_cp[cp_arange, codes[1:]]  # [15, 1024]
                         summed = summed + cp_vecs.sum(0)
                         embed_weight[current_token] = summed.to(torch.bfloat16)
+                        injected_tokens.add(current_token)
 
                 next_token = self.mk_decoder.step(current_token)
                 total_steps += 1
@@ -205,6 +210,17 @@ class MegakernelTTSPipeline:
                 chunk_tokens.append(next_token)
                 codec_tokens.append(next_token)
                 hidden_states.append(h)
+
+                # Repetition detection
+                if next_token == last_token:
+                    repeat_count += 1
+                    if repeat_count >= MAX_REPEAT:
+                        done = True
+                        break
+                else:
+                    repeat_count = 0
+                    last_token = next_token
+
                 current_token = next_token
 
             if not chunk_tokens:
