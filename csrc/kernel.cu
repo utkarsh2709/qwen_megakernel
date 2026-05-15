@@ -34,7 +34,7 @@ constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM; // 1024
 #define LDG_BLOCK_SIZE 512
 #endif
 #ifndef LDG_LM_NUM_BLOCKS
-#define LDG_LM_NUM_BLOCKS 1184
+#define LDG_LM_NUM_BLOCKS 12
 #endif
 #ifndef LDG_LM_BLOCK_SIZE
 #define LDG_LM_BLOCK_SIZE 256
@@ -71,7 +71,7 @@ constexpr int LDG_NUM_WARPS = LDG_BLOCK_SIZE / WARP_SIZE;
 constexpr float LDG_RMS_EPS = 1e-6f;
 
 // LM head
-constexpr int LDG_VOCAB_SIZE = 151936;
+constexpr int LDG_VOCAB_SIZE = 3072;
 
 struct LDGLayerWeights {
   const __nv_bfloat16 *input_layernorm_weight;
