@@ -131,80 +131,147 @@ class MegakernelTTSPipeline:
             hf_cache, self.mk_decoder._k_cache, self.mk_decoder._v_cache)
         self.mk_decoder._position = seq_len
 
-        # --- 4. Megakernel decode loop ---
-        # Use _norm_out buffer (final hidden state) directly after each step.
-        # This eliminates the need for a parallel PyTorch forward pass.
+        # --- 4. Megakernel decode loop with chunked embedding injection ---
+        #
+        # Strategy: decode CHUNK_SIZE tokens with layer-0 embedding only,
+        # then run code_predictor in batch on those tokens to get all 16
+        # codebook layers, then inject summed embeddings for the next chunk.
+        #
+        # This amortizes code_predictor cost: 1 batched call per CHUNK_SIZE
+        # tokens instead of 1 serial call per token.
+        # CHUNK_SIZE=32: ~63ms CP call / 32 tokens = ~2ms overhead/token
+        # vs megakernel ~1ms/token → ~3ms effective = ~333 tok/s
+        #
+        CHUNK_SIZE = 32
+
         t_decode_start = time.time()
         t_first_token  = None
-        codec_tokens   = []   # layer-0 codec token IDs
-        hidden_states  = []   # talker hidden states for code_predictor
+        codec_tokens   = []
+        hidden_states  = []
+
+        codec_embed     = self.talker.get_input_embeddings()
+        cp_embed_tables = self.talker.code_predictor.get_input_embeddings()
+        embed_weight    = self.mk_decoder._embed_weight
+        # Precompute stacked CP weight matrix [15, 2048, 1024] for fast lookup
+        with torch.no_grad():
+            stacked_cp = torch.stack(
+                [t.weight for t in cp_embed_tables], dim=0
+            )  # [15, 2048, 1024]
+        cp_arange = torch.arange(15, device=self.device)
+
+        # all_codes_table[tok] = [16] tensor of all codebook tokens for tok
+        # Used to build summed embeddings for next chunk
+        all_codes_table = {}  # token_id -> [16] LongTensor
 
         current_token = CODEC_BOS_ID
-        for step in range(max_codec_tokens):
-            next_token = self.mk_decoder.step(current_token)
+        done = False
+        total_steps = 0
+        MAX_STEPS = max_codec_tokens * 8  # safety limit
 
-            if t_first_token is None:
-                t_first_token = time.time() - t0
+        while not done and total_steps < MAX_STEPS:
+            # --- Phase A: decode CHUNK_SIZE tokens with current embeddings ---
+            chunk_tokens   = []
+            chunk_hiddens  = []
 
-            if next_token == CODEC_EOS_ID:
+            for _ in range(CHUNK_SIZE):
+                # Inject summed embedding if we have it (fused batch lookup)
+                if current_token in all_codes_table:
+                    codes = all_codes_table[current_token]  # [16] LongTensor
+                    with torch.no_grad():
+                        # Fast stacked lookup: one gather op for all 15 CP tables
+                        summed = codec_embed.weight[codes[0]]  # [1024]
+                        cp_vecs = stacked_cp[cp_arange, codes[1:]]  # [15, 1024]
+                        summed = summed + cp_vecs.sum(0)
+                        embed_weight[current_token] = summed.to(torch.bfloat16)
+
+                next_token = self.mk_decoder.step(current_token)
+                total_steps += 1
+
+                if t_first_token is None:
+                    t_first_token = time.time() - t0
+
+                if next_token == CODEC_EOS_ID:
+                    done = True
+                    break
+                if next_token >= 2048:
+                    current_token = 0
+                    continue
+                if len(codec_tokens) >= max_codec_tokens:
+                    done = True
+                    break
+
+                h = self.mk_decoder._norm_out.clone().to(torch.bfloat16)
+                chunk_hiddens.append(h)
+                chunk_tokens.append(next_token)
+                codec_tokens.append(next_token)
+                hidden_states.append(h)
+                current_token = next_token
+
+            if not chunk_tokens:
                 break
 
-            # Special tokens (>=2048 but not EOS): skip appending but
-            # still advance position — do NOT feed them back as input
-            # or we get stuck in a loop repeating the same context.
-            if next_token >= 2048:
-                # Use a safe fallback token (0) as next input
-                current_token = 0
-                continue
+            # --- Phase B: batch code_predictor on this chunk ---
+            with torch.no_grad():
+                T_chunk = len(chunk_tokens)
+                h_batch = torch.stack(chunk_hiddens, dim=0)   # [T, 1024]
+                c0_ids  = torch.tensor(chunk_tokens, device=self.device)
+                c0_emb  = codec_embed(c0_ids.unsqueeze(1))    # [T, 1, 1024]
+                cp_inp  = torch.cat([h_batch.unsqueeze(1), c0_emb], dim=1)  # [T, 2, 1024]
 
-            # _norm_out is the post-layernorm hidden state (pre-lm_head)
-            # Clone to capture state before next step overwrites it
-            h = self.mk_decoder._norm_out.clone()  # [1024], stays on GPU
-            hidden_states.append(h)
-
-            codec_tokens.append(next_token)
-            current_token = next_token
+                cp_res = self.talker.code_predictor.generate(
+                    inputs_embeds=cp_inp,
+                    max_new_tokens=self.talker.config.num_code_groups - 1,
+                    do_sample=False,
+                    return_dict_in_generate=True,
+                )
+                # sequences: [T, 15]
+                for t_idx in range(T_chunk):
+                    tok_id = chunk_tokens[t_idx]
+                    all_codes = torch.cat([
+                        torch.tensor([tok_id], device=self.device),
+                        cp_res.sequences[t_idx],
+                    ], dim=0)  # [16]
+                    all_codes_table[tok_id] = all_codes
 
         t_decode = time.time() - t_decode_start
         self.mk_decoder.reset()
+
+        # Rebuild all_codes from collected codec_tokens using all_codes_table
+        # (used by Mimi decode below)
 
         if not codec_tokens:
             return np.zeros(1920, dtype=np.float32), AUDIO_HZ, {}
 
         n_tokens = len(codec_tokens)
 
-        # --- 5. Code predictor: batch all T positions at once ---
-        # Instead of T serial calls, run one batched forward pass.
-        # code_predictor forward_finetune takes [T, num_code_groups+1, 1024]
+        # --- 5. Build all_codes [T, 16] from all_codes_table ---
         t_cp_start = time.time()
         T = n_tokens
         all_codes = torch.zeros(T, 16, device=self.device, dtype=torch.long)
         all_codes[:, 0] = torch.tensor(codec_tokens, device=self.device)
 
-        hidden_tensor = torch.stack(hidden_states, dim=0).to(self.dtype)  # [T, 1024]
+        # Fill layers 1-15 from all_codes_table (populated during decode chunks)
+        missing = []
+        for t_idx, tok_id in enumerate(codec_tokens):
+            if tok_id in all_codes_table:
+                all_codes[t_idx] = all_codes_table[tok_id]
+            else:
+                missing.append(t_idx)
 
-        with torch.no_grad():
-            # Clamp layer-0 codes to valid codec vocab range [0, 2047]
-            # Some megakernel outputs may be special tokens (2048-3071)
-            codec_vocab_size = self.talker.code_predictor.config.vocab_size  # 2048
-            all_codes[:, 0] = all_codes[:, 0].clamp(0, codec_vocab_size - 1)
-
-            # Build batch input: [T, 2, 1024] = [hidden | c0_embed] per position
-            c0_emb = self.talker.get_input_embeddings()(
-                all_codes[:, 0:1]
-            )  # [T, 1, 1024]
-            # sub_talker input: [T, 2, 1024]
-            cp_inputs = torch.cat([hidden_tensor.unsqueeze(1), c0_emb], dim=1)
-
-            # Run code_predictor.generate in one batched call
-            cp_result = self.talker.code_predictor.generate(
-                inputs_embeds=cp_inputs,   # [T, 2, 1024]
-                max_new_tokens=self.talker.config.num_code_groups - 1,
-                do_sample=False,
-                return_dict_in_generate=True,
-            )
-            # sequences: [T, 15]
-            all_codes[:, 1:] = cp_result.sequences
+        # Batch fallback for any missing tokens
+        if missing:
+            h_batch = torch.stack([hidden_states[i] for i in missing]).unsqueeze(1)
+            c0_ids  = torch.tensor([codec_tokens[i] for i in missing], device=self.device)
+            c0_emb  = self.talker.get_input_embeddings()(c0_ids.unsqueeze(1))
+            cp_inp  = torch.cat([h_batch, c0_emb], dim=1)
+            with torch.no_grad():
+                cp_res = self.talker.code_predictor.generate(
+                    inputs_embeds=cp_inp,
+                    max_new_tokens=self.talker.config.num_code_groups - 1,
+                    do_sample=False, return_dict_in_generate=True,
+                )
+            for j, t_idx in enumerate(missing):
+                all_codes[t_idx, 1:] = cp_res.sequences[j]
 
         t_cp = time.time() - t_cp_start
 
